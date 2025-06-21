@@ -1,0 +1,423 @@
+---
+title: "C. difficile transcriptional adaptation to adaptive immune pressures"
+subtitle: "Pilot RNA sequencing Rag1 KO vs. control mice"
+author: "Kevin Mears"
+format: html
+editor: visual
+number-sections: true
+embed-resources: true
+---
+
+## Objective
+
+Pilot study to determine gene expression changes of bacterial pathogen Clostridioides difficile to host adaptive immune response. RNA sequencing was performed on intestinal contents from Rag1 KO (adaptive immunity deficient) and control mice at day 21 post-C. difficile infection (strain CD196).
+
+## Methods & Results
+
+```{r}
+#| label: load-packages
+library(tidyverse)
+library(ape) # read.gff
+library(Biostrings) # readDNAStringSet
+library(data.table) #setDT
+library(tximport) # to import kallisto outputs 
+library(cowplot) # allows you to combine multiple plots in one figure; function plot_grid
+library(plotly) # ggplotly 
+library(DT) # datatable
+library(gt) # tab_source_note
+library(matrixStats) # let's us easily calculate stats on rows or columns of a data matrix
+library(edgeR) # for the DGEList object and for normalization methods
+library(limma) # for DEG analysis
+library(ggrepel) # for geom_text_repel
+library(RColorBrewer) # brewer.pal
+library(gplots) # heatmap.2
+```
+
+```{r}
+#| label: Import Kallisto outputs and annotate
+
+# read in your study design
+targets <- read_tsv("studydesign_cecal.txt") 
+path <- file.path(targets$Sample_ID, "abundance.tsv") # set file paths to your mapped data
+all(file.exists(path)) # check that above command worked
+
+# generate table of gene name, id, description from gff file 
+gff.ensembl <- "Clostridioides_difficile_cd196_gca_000085225.ASM8522v1.49.gff3.gz" # from bacteria.ensembl.org
+gff.ensembl <- read.gff(gff.ensembl, na.strings = c(".", "?"), GFF3 = TRUE)
+gff.ensembl.gene <- subset(gff.ensembl, type == "gene") # generates table 
+gff.ensembl.gene.sep <- separate(gff.ensembl.gene, 
+                                 col = "attributes", 
+                                 into = c("ID", "Name", "biotype", "description", "gene_id", "logic_name"), 
+                                 sep = ";", 
+                                 remove = TRUE,
+                                 extra = "warn", 
+                                 fill = "left")
+sum(is.na(gff.ensembl.gene.sep$logic_name)) # check that last column is filled (should be 0)
+
+gff.ensembl.gene.sep.dropped <- subset(gff.ensembl.gene.sep, select = c("type", "start", "end", "strand", "Name", "biotype", "description", "gene_id")) # subset columns of interest 
+
+# simplify columns 
+gff.ensembl.gene.sep.dropped <- tidyr::separate(data = gff.ensembl.gene.sep.dropped, col = "Name", into = c("Category", "Name"), sep = '=')
+gff.ensembl.gene.sep.dropped <- tidyr::separate(data = gff.ensembl.gene.sep.dropped, col = "gene_id", into = c("Blank", "gene_id"), sep = '=')
+gff.ensembl.gene.sep.dropped <- tidyr::separate(data = gff.ensembl.gene.sep.dropped, col = "description", into = c("Blank", "description"), sep = '=')
+
+# save as new data frame
+custom_annotations <- subset(gff.ensembl.gene.sep.dropped, select = c("gene_id", "Name", "description"))
+
+# generate table from fasta file 
+fasta <- readDNAStringSet("Clostridioides_difficile_cd196_gca_000085225.ASM8522v1.cdna.all.fa.gz")
+fasta.df <- data.frame(fasta)
+setDT(fasta.df, keep.rownames = TRUE)[]
+fasta.df.sep <- separate(fasta.df, 
+                         col = 1, 
+                         into = c("ensembl_id", "type", "chromosome", "gene_id", "biotype", "biotype2", "gene_symbol", "description", "blank", "blank2", "blank3", "blank4", "blank5", "blank6", "blank7", "blank8", "blank9", "blank10"), 
+                         sep = " ", 
+                         remove = TRUE,
+                         extra = "warn", 
+                         fill = "warn")
+fasta.df.sep.dropped <- subset(fasta.df.sep, select = c("ensembl_id", "gene_id", "gene_symbol"))
+fasta.df.sep.dropped <- tidyr::separate(data = fasta.df.sep.dropped, col = "gene_id", into = c("blank", "gene_id"), sep = ':')
+gene_id_to_symbol <- subset(fasta.df.sep.dropped, select = c("ensembl_id", "gene_id", "gene_symbol"))
+
+# merge the two tables
+custom_annotations_merge <- merge(gene_id_to_symbol, custom_annotations, by = "gene_id")
+newnames <- gsub(".*:","", custom_annotations_merge$Name) # remove gene: from names
+custom_annotations_merge$Name <- newnames
+
+
+# import kallisto outputs
+Tx <- as_tibble(custom_annotations_merge)
+Tx <- dplyr::select(custom_annotations_merge, c('ensembl_id', 'Name'))
+Tx <- dplyr::rename(Tx, target_id = ensembl_id)
+Tx <- dplyr::rename(Tx, gene_name = Name)
+Txi_gene <- tximport(path, 
+                     type = "kallisto", 
+                     tx2gene = Tx, 
+                     txOut = FALSE, # determines whether your data represented at transcript or gene level; set = TRUE for transcript level
+                     countsFromAbundance = "lengthScaledTPM",
+                     ignoreTxVersion = TRUE)
+
+# determine observed transcripts as proportion of genome (coverage)
+Tx_counts <- as_tibble(Txi_gene$counts)
+Tx_counts_sum <- Tx_counts %>% 
+  mutate(Total = select(., V1:V8) %>%
+         rowSums(na.rm = TRUE)) # sum across samples
+Tx_counts_nonzero <- filter(Tx_counts_sum, Total > 0) # remove genes that was not detected in any sample
+# of 3417 genes, 2735 transcripts detected (~80%)
+```
+
+```{r}
+#| label: Filter and normalize
+
+sampleLabels <- targets$Sample_ID
+myDGEList <- DGEList(Txi_gene$counts)
+log2.cpm <- cpm(myDGEList, log=TRUE)
+
+log2.cpm.df <- as_tibble(log2.cpm, rownames = "geneID")
+colnames(log2.cpm.df) <- c("geneID", sampleLabels)
+log2.cpm.df.pivot <- pivot_longer(log2.cpm.df, 
+                                  cols = Sample01:Sample08, # column names to be stored as a SINGLE variable
+                                  names_to = "samples", # name of that new variable (column)
+                                  values_to = "expression") # name of new variable (column) storing all the values (data)
+
+p1 <- ggplot(log2.cpm.df.pivot) +
+  aes(x=samples, y=expression, fill=samples) +
+  geom_violin(trim = FALSE, show.legend = FALSE) +
+  stat_summary(fun = "median", 
+               geom = "point", 
+               shape = 95, 
+               size = 10, 
+               color = "black", 
+               show.legend = FALSE) +
+  labs(y="log2 expression", x = "sample",
+       title="Log2 Counts per Million (CPM)",
+       subtitle="unfiltered, non-normalized",
+       caption=paste0("produced on ", Sys.time())) +
+  theme_bw()
+
+cpm <- cpm(myDGEList) # counts-per-million
+keepers <- rowSums(cpm>1)>=3 # filter cpm; set to >= smallest group in comparison
+myDGEList.filtered <- myDGEList[keepers,]
+
+log2.cpm.filtered <- cpm(myDGEList.filtered, log=TRUE)
+log2.cpm.filtered.df <- as_tibble(log2.cpm.filtered, rownames = "geneID")
+colnames(log2.cpm.filtered.df) <- c("geneID", sampleLabels)
+log2.cpm.filtered.df.pivot <- pivot_longer(log2.cpm.filtered.df, # dataframe to be pivoted
+                                           cols = Sample01:Sample08, # column names to be stored as a SINGLE variable
+                                           names_to = "samples", # name of that new variable (column)
+                                           values_to = "expression") # name of new variable (column) storing all the values (data)
+
+p2 <- ggplot(log2.cpm.filtered.df.pivot) +
+  aes(x=samples, y=expression, fill=samples) +
+  geom_violin(trim = FALSE, show.legend = FALSE) +
+  stat_summary(fun = "median", 
+               geom = "point", 
+               shape = 95, 
+               size = 10, 
+               color = "black", 
+               show.legend = FALSE) +
+  labs(y="log2 expression", x = "sample",
+       title="Log2 Counts per Million (CPM)",
+       subtitle="filtered, non-normalized",
+       caption=paste0("produced on ", Sys.time())) +
+  theme_bw()
+
+myDGEList.filtered.norm <- calcNormFactors(myDGEList.filtered, method = "TMM") # normalizaiton; the TMM method implements the trimmed mean of M-values method proposed by Robinson and Oshlack (2010).
+log2.cpm.filtered.norm <- cpm(myDGEList.filtered.norm, log=TRUE)
+log2.cpm.filtered.norm.df <- as_tibble(log2.cpm.filtered.norm, rownames = "geneID")
+colnames(log2.cpm.filtered.norm.df) <- c("geneID", sampleLabels)
+log2.cpm.filtered.norm.df.pivot <- pivot_longer(log2.cpm.filtered.norm.df, 
+                                                cols = Sample01:Sample08, # column names to be stored as a SINGLE variable
+                                                names_to = "samples", # name of that new variable (column)
+                                                values_to = "expression") # name of new variable (column) storing all the values (data)
+
+p3 <- ggplot(log2.cpm.filtered.norm.df.pivot) +
+  aes(x=samples, y=expression, fill=samples) +
+  geom_violin(trim = FALSE, show.legend = FALSE) +
+  stat_summary(fun = "median", 
+               geom = "point", 
+               shape = 95, 
+               size = 10, 
+               color = "black", 
+               show.legend = FALSE) +
+  labs(y="log2 expression", x = "sample",
+       title="Log2 Counts per Million (CPM)",
+       subtitle="filtered, TMM normalized",
+       caption=paste0("produced on ", Sys.time())) +
+  theme_bw()
+
+plot_grid(p1, p2, p3, labels = c('A', 'B', 'C'), label_size = 12)
+```
+
+```{r}
+#| label: Hierarchical clustering and PCA
+
+distance <- dist(t(log2.cpm.filtered.norm), method = "maximum") #other distance methods are "euclidean", maximum", "manhattan", "canberra", "binary" or "minkowski"
+clusters <- hclust(distance, method = "average") #other agglomeration methods are "ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", or "centroid"
+plot(clusters, labels=sampleLabels) # produces dendrogram of clusters
+
+group <- targets$Genotype
+group <- factor(group)
+
+type <- targets$Type
+type <- factor(type)
+
+pca.res <- prcomp(t(log2.cpm.filtered.norm), scale.=F, retx=T)
+pc.var <- pca.res$sdev^2 # sdev^2 captures these eigenvalues from the PCA result
+pc.per <- round(pc.var/sum(pc.var)*100, 1) 
+pca.res.df <- as_tibble(pca.res$x)
+pca.plot <- ggplot(pca.res.df) +
+  aes(x=PC1, y=PC2, label=sampleLabels, color = group) + # add shape = type multiple sample types
+  geom_point(size=4) +
+  #stat_ellipse() +
+  scale_color_manual(values=c("#0000CC", "#CC0000")) +
+  xlab(paste0("PC1 (",pc.per[1],"%",")")) + 
+  ylab(paste0("PC2 (",pc.per[2],"%",")")) +
+  labs(title="PCA: Rag1 Het vs. KO", 
+       color="") +
+  coord_fixed() +
+  theme_bw() 
+
+pca.plot + theme(
+  plot.title=element_text(hjust=0.5),
+  plot.margin=margin(0,0,0,0, "pt")
+)
+ggplotly(pca.plot) # interactive
+
+mydata.df <- mutate(log2.cpm.filtered.norm.df,
+                    Het.AVG = (Sample01 + Sample02 + Sample03)/3, 
+                    KO.AVG = (Sample04 + Sample05 + Sample06 + Sample07 + Sample08)/5,
+                    LogFC = (Het.AVG - KO.AVG)) %>% 
+  mutate_if(is.numeric, round, 2)
+
+# interactive table of average expression
+datatable(mydata.df[,c(1,10:12)], 
+          extensions = c('KeyTable', "FixedHeader"), 
+          filter = 'top',
+          fillContainer = FALSE,
+          options = list(keys = TRUE, 
+                         searchHighlight = TRUE, 
+                         pageLength = 10, 
+                         lengthMenu = c("10", "25", "50", "100")))
+
+# sort descending (upregulated in Het)
+mydata.desc <- mydata.df %>%
+  dplyr::arrange(desc(LogFC)) #%>% 
+#dplyr::select(geneID, LogFC)
+
+# sort ascending (upregulated in KO)
+mydata.asc <- mydata.df %>%
+  dplyr::arrange((LogFC)) #%>% 
+#dplyr::select(geneID, LogFC)
+
+# interactive table (log2FC for each sample)
+datatable(mydata.df[,c(1:12)], 
+          extensions = c('KeyTable', "FixedHeader"), 
+          filter = 'top',
+          fillContainer = FALSE,
+          options = list(keys = TRUE, 
+                         searchHighlight = TRUE, 
+                         pageLength = 10, 
+                         lengthMenu = c("10", "25", "50", "100")))
+```
+
+```{r}
+#| label: Linear regression
+
+design <- model.matrix(~0 + group) # convert group to binary
+colnames(design) <- levels(group)
+
+v.DEGList.filtered.norm <- voom(myDGEList.filtered.norm, design, plot = TRUE) # models the mean-variance relationship for applying weights (RNAseq data is heteroscedastic = unequal variability across gene expression levels)
+fit <- lmFit(v.DEGList.filtered.norm, design) # fit linear model
+contrast.matrix <- makeContrasts(genotype = Het - KO, # specify pair-wise comparison
+                                 levels=design)
+
+fits <- contrasts.fit(fit, contrast.matrix)
+ebFit <- eBayes(fits) # get bayesian stats for linear model fit 
+myTopHits <- topTable(ebFit, adjust ="BH", coef=1, number=40000, sort.by="logFC") # multiple-testing correction accounts for repeated (each gene)pair-wise comparison; BH common for DEG analysis  
+myTopHits.df <- myTopHits %>%
+  as_tibble(rownames = "geneID")
+```
+
+```{r}
+#| label: DEG tables
+
+myTopHits.df.p0.1 <- subset(myTopHits.df, adj.P.Val<=0.1)
+
+myTopHits.df.upHet <- subset(myTopHits.df.p0.1, logFC>0)
+myTopHits.df.upHet <- myTopHits.df.upHet[c(01:07)]
+
+myTopHits.df.upHet %>%
+  gt() %>%
+  tab_header(title = md("**CD196 Genes Upregulated in Rag Het**"),
+             subtitle = md("Day 21 post-infection, cecal content, *n = 3 Het & 5 KO*")) %>%
+  tab_source_note(
+    source_note = md("Adjusted p-value < 0.1")) %>%
+  tab_source_note(
+    source_note = md("Benjamini-Hochberg multiple testing correction"))
+
+myTopHits.df.upKO <- subset(myTopHits.df.p0.1, logFC<0)
+myTopHits.df.upKO <- myTopHits.df.upKO[c(01:07)]
+
+myTopHits.df.upKO %>%
+  gt() %>%
+  tab_header(title = md("**CD196 Genes Upregulated in Rag KO**"),
+             subtitle = md("Day 21 post-infection, cecal content, *n = 3 Het & 5 KO*")) %>%
+  tab_source_note(
+    source_note = md("Adjusted p-value < 0.1")) %>%
+  tab_source_note(
+    source_note = md("Benjamini-Hochberg multiple testing correction"))
+
+# interactive table
+datatable(myTopHits.df, 
+          extensions = c('KeyTable', "FixedHeader"), 
+          filter = 'top',
+          fillContainer = FALSE,
+          options = list(keys = TRUE, 
+                         searchHighlight = TRUE, 
+                         pageLength = 10, 
+                         lengthMenu = c("10", "25", "50", "100")))
+```
+
+```{r}
+#| label: volcano plot
+
+# label differentially expressed genes
+myTopHits.df$trend <- "Neither"
+myTopHits.df$trend[myTopHits.df$logFC > 1 & myTopHits$adj.P.Val < 0.1] <- "Up in Hets"
+myTopHits.df$trend[myTopHits.df$logFC < -1 & myTopHits$adj.P.Val < 0.1] <- "Up in KOs"
+
+myTopHits.df$diffexpressed <- "Neither"
+myTopHits.df$diffexpressed[myTopHits.df$logFC > 1 & myTopHits$adj.P.Val < 0.05] <- "Up in Hets"
+myTopHits.df$diffexpressed[myTopHits.df$logFC < -1 & myTopHits$adj.P.Val < 0.05] <- "Up in KOs"
+
+myTopHits.df$delabel <- NA
+myTopHits.df$delabel[myTopHits.df$diffexpressed != "Neither"] <- myTopHits.df$geneID[myTopHits.df$diffexpressed != "Neither"]
+
+# volcano
+vplot <- ggplot(myTopHits.df) +
+  aes(x=logFC, y=-log10(adj.P.Val), col=trend, label=delabel) +
+  geom_point(size=3) +
+  geom_label_repel(show.legend=FALSE) +
+  scale_color_manual(values=c("#CCCCCC", "#0000CC", "#CC0000")) +
+  geom_hline(yintercept = -log10(0.1), linetype="longdash", colour="grey", size=1) +
+  geom_vline(xintercept = -1, linetype="longdash", colour="#CC0000", size=1) +
+  geom_vline(xintercept = 1, linetype="longdash", colour="#0000CC", size=1) +
+  theme_bw() +
+  xlab("log2FC") +
+  labs(title="CD196 Differentially Expressed Genes: Rag1 Het vs. KO", 
+       subtitle = "Day 21 post-infection, cecal content, n = 3 Het & 5 KO", 
+       caption=paste0("labeled = adjusted p-value < 0.05 \n colored = adjusted p-value < 0.1"), 
+       color="") +
+  theme(plot.title=element_text(hjust=0.5), plot.subtitle=element_text(hjust=0.5), plot.caption = element_text(hjust=0))
+
+vplot # static
+
+vplot <- ggplot(myTopHits.df) +
+  aes(y=-log10(adj.P.Val), x=logFC, text = paste("Symbol:", geneID)) +
+  geom_point(size=2) +
+  geom_hline(yintercept = -log10(0.05), linetype="longdash", colour="grey", size=1) +
+  geom_vline(xintercept = 1, linetype="longdash", colour="#BE684D", size=1) +
+  geom_vline(xintercept = -1, linetype="longdash", colour="#2C467A", size=1) +
+labs(title="C. difficile CD196 Gene Expression",
+     subtitle = "Rag Het vs KO, day 21 cecal content",
+     caption=paste0("produced on ", Sys.time())) +
+  theme_bw()
+
+ggplotly(vplot) # interactive volcano plot 
+
+# retrieve expression data for DEGs (column E)
+results <- decideTests(ebFit, method="global", adjust.method="BH", p.value=0.1, lfc=1) # set to 0.1 for trends (low n number)
+colnames(v.DEGList.filtered.norm$E) <- sampleLabels
+diffGenes <- v.DEGList.filtered.norm$E[results[,1] !=0,] # extract expression data for genes that don't equal 0 (i.e. all differentially expressed genes)
+diffGenes.df <- as_tibble(diffGenes, rownames = "geneID")
+
+# generate interactive table of DEGs (expression by sample)
+datatable(diffGenes.df, 
+          extensions = c('KeyTable', "FixedHeader"), 
+          caption = 'Table 1: DEGs CD196 Rag Het vs. KO, day 21 cecal content (n = 3 Hets & 5 KOs)',
+          fillContainer = FALSE,
+          options = list(keys = TRUE, searchHighlight = TRUE, pageLength = 10, lengthMenu = c("10", "25", "50", "100"))) %>%
+  formatRound(columns=c(2:9), digits=2)
+
+#write your DEGs to a file
+write_tsv(diffGenes.df,"DiffGenes.txt") #NOTE: this .txt file can be directly used for input into other clustering or network analysis tools (e.g., String, Clust (https://github.com/BaselAbujamous/clust, etc.)
+
+```
+
+```{r}
+#| label: Heat map
+myheatcolors <- rev(brewer.pal(name="RdBu", n=11)) # choose color palette for heat maps
+clustRows <- hclust(as.dist(1-cor(t(diffGenes), method="pearson")), method="complete") # cluster rows (genes) by pearson correlation - linear correlation between two variables 
+# '1-cor' converts this to a 0-2 scale for each of these correlations, which can then be used to calculate a distance matrix using 'as.dist'
+clustColumns <- hclust(as.dist(1-cor(diffGenes, method="spearman")), method="complete") # cluster columns (samples); spearman method gives equal weight to highly/lowly expressed genes (ranked correlation) 
+module.assign <- cutree(clustRows, k=2)
+#module.color <- hcl.colors(length(unique(module.assign)), palette = "Blue-Red", rev=FALSE) 
+module.color <- c("#0000CC", "#CC0000") # manual colors red and blue 
+module.color <- module.color[as.vector(module.assign)] 
+
+sample_name <- c("Het 1 (F)", "Het 2 (F)", "Het 3 (M)", "KO 1 (F)", "KO 2 (F)", "KO 3 (M)", "KO 4 (M)", "KO 5 (M)")
+diffGenes_sample_name <- diffGenes
+colnames(diffGenes_sample_name) <- sample_name
+
+myheatcolors <- rev(brewer.pal(name="RdBu", n=11)) # choose color palette for heat maps
+clustRows <- hclust(as.dist(1-cor(t(diffGenes_sample_name), method="pearson")), method="complete") # cluster rows (genes) by pearson correlation - linear correlation between two variables 
+# '1-cor' converts this to a 0-2 scale for each of these correlations, which can then be used to calculate a distance matrix using 'as.dist'
+clustColumns <- hclust(as.dist(1-cor(diffGenes_sample_name, method="spearman")), method="complete") # cluster columns (samples); spearman method gives equal weight to highly/lowly expressed genes (ranked correlation) 
+module.assign <- cutree(clustRows, k=2)
+#module.color <- hcl.colors(length(unique(module.assign)), palette = "Blue-Red", rev=FALSE) 
+module.color <- c("#0000CC", "#CC0000") # manual colors red and blue 
+module.color <- module.color[as.vector(module.assign)] 
+heatmap.2(diffGenes_sample_name, 
+          Rowv=as.dendrogram(clustRows), 
+          Colv=as.dendrogram(clustColumns),
+          RowSideColors=module.color,
+          col=myheatcolors, scale='row', labRow=NA,
+          density.info="none", trace="none",  
+          cexRow=1, cexCol=2, margins=c(8,3), 
+          main="Differential Gene Expression \n adj. p-value < 0.1")
+```
+
+## Conclusions
+
+In this pilot study, we sought to determine transcriptional adaptation of C. difficile in response to adaptive immune pressures by comparing C. difficile gene expression between Rag1 KO and control mice. We found that several genes involved in carbohydrate and amino acid import are upregulated in KO mice, indicating differences in nutrient availability between genotypes. This is in line with previous works (Fletcher et al. 2021 and Pruss et al. 2021) that showed that C. difficile exploits host-derived nutrients from inflammation. Previous work from our lab (Littman et al. 2021) showed Rag1 KO mice have elevated inflammation from C. difficile infection compared to Het control mice. Thus, in Rag1 KO mice, C. difficile is alters its gene expression to utilize amino acids and carbohydrates that are enriched in the inflammatory intestinal environment.

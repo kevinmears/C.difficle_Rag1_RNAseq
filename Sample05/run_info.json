@@ -1,0 +1,13 @@
+{
+	"n_targets": 3479,
+	"n_bootstraps": 0,
+	"n_processed": 31324670,
+	"n_pseudoaligned": 20740,
+	"n_unique": 20488,
+	"p_pseudoaligned": 0.1,
+	"p_unique": 0.1,
+	"kallisto_version": "0.46.1",
+	"index_version": 10,
+	"start_time": "Wed Dec 22 11:22:50 2021",
+	"call": "kallisto quant -i CD196_complete_genome_ENA.index -o 05_ABT049 -t 12 --single -l 295 -s 30 05_Kevin_totalRNA_S5_L001_R1_001.fastq.gz"
+}

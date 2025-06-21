@@ -1,0 +1,10 @@
+Sample_ID	Mouse_ID	Genotype	Type
+Sample01	1	Het	Cecal
+Sample02	2	Het	Cecal
+Sample03	3	Het	Cecal
+Sample04	4	KO	Cecal
+Sample05	5	KO	Cecal
+Sample06	6	KO	Cecal
+Sample07	7	KO	Cecal
+Sample08	8	KO	Cecal
+
