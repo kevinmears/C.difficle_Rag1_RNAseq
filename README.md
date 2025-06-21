@@ -7,3 +7,4 @@ This repository contains the following for analysis:
 3. reference sequence "~.fa.gz"
 4. study design
 5. qmd file containing the code used for RNA seq analysis
+6. html file outlining objective, methodology, and conclusions from this study 
